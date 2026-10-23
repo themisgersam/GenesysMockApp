@@ -134,9 +134,26 @@ fun ChatScreen(
                 }
             }
             Row(Modifier.fillMaxWidth().padding(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedTextField(input, { input = it }, placeholder = { Text("Type a message") }, modifier = Modifier.weight(1f))
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    placeholder = {
+                        Text(
+                            when {
+                                !state.canSend -> state.connection
+                                state.awaitingReply -> "Waiting for a reply…"
+                                else -> "Type a message"
+                            }
+                        )
+                    },
+                    enabled = state.canSend && !state.awaitingReply,
+                    modifier = Modifier.weight(1f),
+                )
                 Spacer(Modifier.width(8.dp))
-                Button(onClick = { onSend(input); input = "" }, enabled = input.isNotBlank()) { Text("Send") }
+                Button(
+                    onClick = { onSend(input); input = "" },
+                    enabled = input.isNotBlank() && state.canSend && !state.awaitingReply,
+                ) { Text("Send") }
             }
         }
     }

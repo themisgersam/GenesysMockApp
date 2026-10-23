@@ -7,12 +7,14 @@ import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.genesys.cloud.messenger.transport.core.Configuration
+import com.genesys.cloud.messenger.transport.core.ErrorCode
 import com.genesys.cloud.messenger.transport.core.Message
 import com.genesys.cloud.messenger.transport.core.MessageEvent
 import com.genesys.cloud.messenger.transport.core.MessagingClient
 import com.genesys.cloud.messenger.transport.core.MessagingClient.State
 import com.genesys.cloud.messenger.transport.core.MessengerTransportSDK
 import com.genesys.cloud.messenger.transport.core.events.Event
+import com.genesys.cloud.messenger.transport.util.DefaultVault
 import com.genesys.cloud.messenger.transport.util.EncryptedVault
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.delay
@@ -28,6 +30,9 @@ data class ChatLine(val id: String, val fromUser: Boolean, val text: String)
 data class UiState(
     val loggedIn: Boolean = false,
     val connection: String = "Idle",
+    val canSend: Boolean = false,
+    /** True after the user sends a message, until an agent/bot reply arrives. */
+    val awaitingReply: Boolean = false,
     val messages: List<ChatLine> = emptyList(),
     val error: String? = null,
     /** Debug: what the SDK's customAttributesStore currently holds. */
@@ -43,6 +48,7 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
     val state = _state.asStateFlow()
 
     private var client: MessagingClient? = null
+    private var sdk: MessengerTransportSDK? = null
     private var attributes: Map<String, String> = emptyMap()
 
     // True once we know the active session is a brand-new one (no prior conversation).
@@ -63,44 +69,63 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         attributes = mapOf("name" to name, "mobileNumber" to mobile, "email" to email)
         freshSession = false
         loggingOut = false
-        _state.value = UiState(loggedIn = true, connection = "Connecting…")
+        _state.value = UiState(loggedIn = true, connection = "Connecting…", canSend = false)
 
-        try {
-            EncryptedVault.context = getApplication()
-            val sdk = MessengerTransportSDK(
-                Configuration(
-                    deploymentId = config.deploymentId,
-                    domain = config.domain,
-                    logging = true,
-                ),
-            )
-            val c = sdk.createMessagingClient()
-            c.stateChangedListener = { (newState) -> onStateChanged(newState) }
-            c.messageListener = { onMessage(it) }
-            c.eventListener = { onEvent(it) }
-            // Custom attributes are sent to Genesys with the first message / autostart event.
-            c.customAttributesStore.add(attributes)
-            client = c
-            refreshAttributes()
-            c.connect()
-        } catch (t: Throwable) {
-            Log.e(TAG, "login failed", t)
-            _state.value = UiState(loggedIn = false, error = t.message ?: "Failed to connect")
+        viewModelScope.launch {
+            try {
+                // Vault needs an app context; set both types so whichever the SDK picks is initialised.
+                val appContext = getApplication<Application>().applicationContext
+                EncryptedVault.context = appContext
+                DefaultVault.context = appContext
+                val sdk = MessengerTransportSDK(
+                    Configuration(
+                        deploymentId = config.deploymentId,
+                        domain = config.domain,
+                        logging = true,
+                        encryptedVault = true,
+                    ),
+                )
+                // Forget any stored session token so this login always starts a brand-new conversation.
+                sdk.forgetSession()
+                this@ChatViewModel.sdk = sdk
+                // Required before connect(); also validates the deployment ID / domain.
+                sdk.fetchDeploymentConfig()
+                if (loggingOut || !_state.value.loggedIn) return@launch // user logged out meanwhile
+
+                val c = sdk.createMessagingClient()
+                c.stateChangedListener = { onStateChanged(it.newState) }
+                c.messageListener = { onMessage(it) }
+                c.eventListener = { onEvent(it) }
+                // Custom attributes are sent to Genesys with the first message / autostart event.
+                c.customAttributesStore.add(attributes)
+                client = c
+                refreshAttributes()
+                c.connect()
+            } catch (t: Throwable) {
+                Log.e(TAG, "login failed", t)
+                client = null
+                _state.value = UiState(loggedIn = false, error = t.message ?: "Failed to connect")
+            }
         }
     }
 
     fun send(text: String) {
         val c = client ?: return
         if (text.isBlank()) return
+        if (c.currentState !is State.Configured) {
+            Log.w(TAG, "Cannot send message: MessagingClient state is ${c.currentState}")
+            _state.update { it.copy(error = "Chat is not connected. Please wait until connected.") }
+            return
+        }
         try {
             // Re-add in case the store was cleared by a session close/error; also passed explicitly.
             c.customAttributesStore.add(attributes)
             c.sendMessage(text.trim(), attributes)
-            _state.update { it.copy(lastSentAttributes = attributes) }
+            _state.update { it.copy(lastSentAttributes = attributes, awaitingReply = true) }
             refreshAttributes()
         } catch (t: Throwable) {
             Log.e(TAG, "send failed", t)
-            _state.update { it.copy(error = t.message) }
+            _state.update { it.copy(error = t.message ?: "Failed to send message") }
         }
     }
 
@@ -140,6 +165,8 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         } catch (t: Throwable) {
             Log.w(TAG, "disconnect", t)
         }
+        sdk?.forgetSession()
+        sdk = null
         attributes = emptyMap()
         _state.value = UiState()
     }
@@ -155,19 +182,16 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
             is State.Closed, is State.Closing -> "Disconnected"
             else -> "Idle"
         }
-        _state.update { it.copy(connection = label) }
+        val isConfigured = newState is State.Configured
+        _state.update { it.copy(connection = label, canSend = isConfigured) }
 
         if ((newState is State.Configured) && !freshSession) {
             if (newState.newSession) {
                 freshSession = true
             } else {
-                // A previous conversation was restored from the vault: wipe it so every login starts fresh.
-                _state.update { it.copy(messages = emptyList(), connection = "Starting new conversation…") }
-                try {
-                    client?.clearConversation()
-                } catch (t: Throwable) {
-                    Log.e(TAG, "clear on login failed", t)
-                }
+                // Should not happen since the token is reset on login; drop any restored history anyway.
+                _state.update { it.copy(messages = emptyList()) }
+                freshSession = true
             }
         }
         if (newState is State.Configured) {
@@ -191,7 +215,10 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 }
             }
-            is Event.Error -> _state.update { it.copy(error = event.message ?: event.errorCode.toString()) }
+            is Event.Error -> if (loggingOut && event.errorCode == ErrorCode.ClearConversationFailure) {
+                // Deployment doesn't allow clearing; the session token is dropped locally instead.
+                finishLogout()
+            } else _state.update { it.copy(error = event.message ?: event.errorCode.toString()) }
             else -> Unit
         }
     }
@@ -210,8 +237,19 @@ class ChatViewModel(app: Application) : AndroidViewModel(app) {
         val text = m.text?.takeIf { it.isNotBlank() } ?: return
         val line = ChatLine(m.id, fromUser = m.direction == Message.Direction.Inbound, text = text)
         _state.update { s ->
-            val i = s.messages.indexOfFirst { (id) -> id == line.id }
-            s.copy(messages = if (i >= 0) s.messages.toMutableList().also { it[i] = line } else s.messages + line)
+            val i = s.messages.indexOfFirst { it.id == line.id }
+            s.copy(
+                messages = if (i >= 0) s.messages.toMutableList().also { it[i] = line } else s.messages + line,
+                awaitingReply = if (line.fromUser) s.awaitingReply else false,
+            )
+        }
+    }
+
+    private fun MessengerTransportSDK.forgetSession() {
+        try {
+            vault.remove(vault.keys.tokenKey)
+        } catch (t: Throwable) {
+            Log.w(TAG, "could not reset session token", t)
         }
     }
 
