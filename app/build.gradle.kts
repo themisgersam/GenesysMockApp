@@ -16,7 +16,7 @@ android {
         versionName = "1.0"
 
         // Default Genesys values; both can be overridden at runtime from the login screen's Settings section.
-        buildConfigField("String", "DEFAULT_DEPLOYMENT_ID", "\"78263412-6023-4f3a-bae8-7104ea00cfe6\"")
+        buildConfigField("String", "DEFAULT_DEPLOYMENT_ID", "\"your_deployment_id_here\"")
         buildConfigField("String", "DEFAULT_DOMAIN", "\"mypurecloud.de\"")
     }
 
