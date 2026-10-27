@@ -21,6 +21,7 @@ fun LoginScreen(
     error: String?,
     onLogin: (String, String, String, GenesysConfig) -> Unit,
     onDismissError: () -> Unit = {},
+    onCancel: () -> Unit = {},
 ) {
     var name by remember { mutableStateOf("") }
     var mobile by remember { mutableStateOf("") }
@@ -70,6 +71,7 @@ fun LoginScreen(
                 enabled = valid,
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Login") }
+            TextButton(onClick = onCancel, modifier = Modifier.fillMaxWidth()) { Text("Cancel") }
         }
     }
 }

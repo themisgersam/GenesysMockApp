@@ -5,7 +5,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="Genesys Mock"
+        android:label="IST App"
         android:theme="@style/Theme.GenesysMock">
         <activity
             android:name=".MainActivity"
